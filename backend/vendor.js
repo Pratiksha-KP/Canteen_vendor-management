@@ -195,6 +195,61 @@ app.post("/order", authMiddleware, async (req, res) => {
   }
 });
 
+
+// ---------------- VENDOR: Get Analytics Dashboard ----------------
+app.get("/analytics", authMiddleware, async (req, res) => {
+  const vendorId = req.user.id;
+  const canteenId = req.user.canteenId;
+
+  try {
+    // 1. Total Sales and Orders for Today
+    const salesResult = await pool.query(
+      `SELECT 
+         COALESCE(SUM(total_amount), 0) AS total_sales,
+         COUNT(*) AS total_orders
+       FROM orders
+       WHERE vendor_id = $1
+         AND DATE(created_at) = CURRENT_DATE`,
+      [vendorId]
+    );
+
+    // 2. Most Popular Items (for the whole canteen)
+    const popularItemsResult = await pool.query(
+      `SELECT 
+         mi.name, 
+         SUM(oi.quantity) AS total_sold
+       FROM orderitems oi
+       JOIN menuitems mi ON oi.menu_item_id = mi.id
+       WHERE mi.canteen_id = $1
+       GROUP BY mi.name
+       ORDER BY total_sold DESC
+       LIMIT 5`, // Get top 5 items
+      [canteenId]
+    );
+
+    // 3. Order Status Breakdown (for the logged-in vendor)
+    const statusResult = await pool.query(
+      `SELECT 
+         status, 
+         COUNT(*) AS count
+       FROM orders
+       WHERE vendor_id = $1
+         AND status IN ('pending', 'preparing', 'almost ready', 'ready')
+       GROUP BY status`,
+      [vendorId]
+    );
+
+    res.json({
+      salesToday: salesResult.rows[0],
+      popularItems: popularItemsResult.rows,
+      statusBreakdown: statusResult.rows,
+    });
+  } catch (err) {
+    console.error("❌ Error fetching analytics:", err.message);
+    res.status(500).json({ error: "Failed to fetch analytics." });
+  }
+});
+
 // ---------------- VENDOR: Get Orders for their Canteen ----------------
 app.get("/orders", authMiddleware, async (req, res) => {
   const vendorId = req.user.id;
@@ -272,6 +327,78 @@ app.post("/sms", async (req, res) => {
 
   res.set("Content-Type", "text/xml");
   res.send("<Response></Response>");
+});
+
+// ---------------- VENDOR: Add a new Menu Item ----------------
+app.post("/menu", authMiddleware, async (req, res) => {
+  const { name, price, description } = req.body;
+  const canteenId = req.user.canteenId;
+
+  if (!name || !price) {
+    return res.status(400).json({ error: "Name and price are required." });
+  }
+
+  try {
+    const result = await pool.query(
+      "INSERT INTO menuitems (name, price, description, canteen_id) VALUES ($1, $2, $3, $4) RETURNING *",
+      [name, price, description, canteenId]
+    );
+    res.status(201).json({ message: "Item added to menu", item: result.rows[0] });
+  } catch (err) {
+    console.error("❌ Error adding menu item:", err.message);
+    res.status(500).json({ error: "Failed to add item." });
+  }
+});
+
+// ---------------- VENDOR: Update a Menu Item (Price, Availability, etc.) ----------------
+app.put("/menu/:id", authMiddleware, async (req, res) => {
+  const itemId = req.params.id;
+  const { name, price, description, is_available } = req.body;
+  const canteenId = req.user.canteenId; // To ensure vendor can only edit their own items
+
+  try {
+    const result = await pool.query(
+      `UPDATE menuitems 
+       SET 
+         name = $1, 
+         price = $2, 
+         description = $3, 
+         is_available = $4 
+       WHERE id = $5 AND canteen_id = $6 RETURNING *`,
+      [name, price, description, is_available, itemId, canteenId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Item not found or you do not have permission to edit it." });
+    }
+    res.json({ message: "Item updated successfully", item: result.rows[0] });
+  } catch (err) {
+    console.error("❌ Error updating menu item:", err.message);
+    res.status(500).json({ error: "Failed to update item." });
+  }
+});
+
+// ---------------- VENDOR: Delete a Menu Item ----------------
+app.delete("/menu/:id", authMiddleware, async (req, res) => {
+  const itemId = req.params.id;
+  const canteenId = req.user.canteenId; // Security check
+
+  try {
+    const result = await pool.query(
+      "DELETE FROM menuitems WHERE id = $1 AND canteen_id = $2 RETURNING *",
+      [itemId, canteenId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Item not found or you do not have permission to delete it." });
+    }
+    res.json({ message: "Item deleted successfully" });
+  } catch (err) {
+    console.error("❌ Error deleting menu item:", err.message);
+    // This will fail if the item is part of an existing order in 'orderitems'
+    // This is a good thing (referential integrity)!
+    res.status(500).json({ error: "Failed to delete item. It may be part of an existing order." });
+  }
 });
 
 // ---------------- Start Vendor Server ----------------
